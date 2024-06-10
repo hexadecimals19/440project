@@ -1,90 +1,113 @@
 import socket
 import ssl
-import threading
 import tkinter as tk
-from tkinter import simpledialog, scrolledtext, messagebox
+from tkinter import simpledialog
+from cryptography.fernet import Fernet
+import pyotp
+import threading
+
+# Client configuration
+HOST = '127.0.0.1'
+PORT = 12345
+
+# Load encryption key from file
+with open("secret.key", "rb") as key_file:
+    key = key_file.read()
+
+cipher = Fernet(key)
+
+# Load OTP secret from file
+with open("otp_secret.txt", "r") as secret_file:
+    otp_secret = secret_file.read().strip()
+
+totp = pyotp.TOTP(otp_secret)
+
 
 class ChatClient:
     def __init__(self, master):
         self.master = master
-        self.master.title("Secure Chat Room")
+        self.master.title("Secure Chat Client")
 
-        self.frame = tk.Frame(self.master)
-        self.frame.pack(pady=20)
+        self.chat_log = tk.Text(master, state='disabled')
+        self.chat_log.pack()
 
-        self.text_area = scrolledtext.ScrolledText(self.frame, wrap=tk.WORD, width=50, height=20, state='disabled')
-        self.text_area.pack()
+        self.message_entry = tk.Entry(master)
+        self.message_entry.pack()
+        self.message_entry.bind("<Return>", self.send_message)
 
-        self.msg_entry = tk.Entry(self.frame, width=50)
-        self.msg_entry.pack(pady=10)
+        self.leave_button = tk.Button(master, text="Leave Chat", command=self.leave_chat)
+        self.leave_button.pack()
 
-        self.send_button = tk.Button(self.frame, text="Send", command=self.send_message)
-        self.send_button.pack()
+        self.username = simpledialog.askstring("Username", "Enter your username")
 
-        self.quit_button = tk.Button(self.frame, text="Quit", command=self.quit_chat)
-        self.quit_button.pack(pady=10)
+        # Prompt for OTP
+        otp = simpledialog.askstring("2FA", "Enter the OTP")
+        if not self.authenticate(otp):
+            print("Authentication failed")
+            self.master.destroy()
+            return
 
-        context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
-        context.load_verify_locations(cafile="server_cert.pem")
-        context.load_cert_chain(certfile="client_cert.pem", keyfile="client_key.pem")
+        self.context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+        self.context.load_verify_locations('cert.pem')
 
-        raw_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        raw_socket.connect(('localhost', 12345))
-        self.client_socket = context.wrap_socket(raw_socket, server_hostname='localhost')
+        try:
+            self.client_socket = self.context.wrap_socket(socket.socket(socket.AF_INET, socket.SOCK_STREAM),
+                                                          server_hostname=HOST)
+            self.client_socket.connect((HOST, PORT))
+            self.client_socket.send(self.username.encode())
+            self.client_socket.send(otp.encode())
 
-        self.authenticate()
-        self.receive_thread = threading.Thread(target=self.receive_messages)
-        self.receive_thread.start()
+            auth_response = self.client_socket.recv(1024).decode()
+            if auth_response != "Authentication successful":
+                print("Authentication failed")
+                self.master.destroy()
+                return
 
-    def authenticate(self):
-        while True:
-            username = simpledialog.askstring("Username", "Enter your username:", parent=self.master)
-            password = simpledialog.askstring("Password", "Enter your password:", parent=self.master, show='*')
+            threading.Thread(target=self.receive_messages).start()
 
-            self.client_socket.send(username.encode())
-            self.client_socket.send(password.encode())
+            # Display welcome message in the client's own chat window
+            self.display_message(f"Welcome, {self.username}!")
 
-            response = self.client_socket.recv(1024).decode()
-            if "Login successful" in response:
-                self.text_area.config(state='normal')
-                self.text_area.insert(tk.END, response + '\n')
-                self.text_area.config(state='disabled')
-                self.text_area.see(tk.END)
-                break
-            else:
-                messagebox.showerror("Error", response)
+        except ssl.SSLError as e:
+            print(f"SSL error: {e}")
+            self.master.destroy()
+        except ConnectionResetError as e:
+            print(f"Connection error: {e}")
+            self.master.destroy()
+
+    def authenticate(self, otp):
+        return totp.verify(otp)
+
+    def send_message(self, event):
+        message = self.message_entry.get()
+        encrypted_message = cipher.encrypt(message.encode())
+        self.client_socket.send(encrypted_message)
+        self.message_entry.delete(0, tk.END)
+
+    def leave_chat(self):
+        leave_message = "!LEAVE"
+        encrypted_message = cipher.encrypt(leave_message.encode())
+        self.client_socket.send(encrypted_message)
+        self.master.destroy()
 
     def receive_messages(self):
         while True:
             try:
-                message = self.client_socket.recv(1024).decode()
+                message = self.client_socket.recv(2048)
                 if message:
-                    self.text_area.config(state='normal')
-                    self.text_area.insert(tk.END, message + '\n')
-                    self.text_area.config(state='disabled')
-                    self.text_area.see(tk.END)
-                else:
-                    self.client_socket.close()
-                    break
-            except:
-                self.client_socket.close()
+                    decrypted_message = cipher.decrypt(message).decode()
+                    self.display_message(decrypted_message)
+            except Exception as e:
+                print(f"Error receiving message: {e}")
                 break
 
-    def send_message(self):
-        message = self.msg_entry.get()
-        if message:
-            self.client_socket.send(message.encode())
-            self.msg_entry.delete(0, tk.END)
+    def display_message(self, message):
+        self.chat_log.config(state='normal')
+        self.chat_log.insert(tk.END, message + "\n")
+        self.chat_log.config(state='disabled')
 
-    def quit_chat(self):
-        self.client_socket.send('Client has left the chat'.encode())
-        self.client_socket.close()
-        self.master.quit()
-
-def main():
-    root = tk.Tk()
-    app = ChatClient(root)
-    root.mainloop()
 
 if __name__ == "__main__":
-    main()
+    root = tk.Tk()
+    client = ChatClient(root)
+    root.mainloop()

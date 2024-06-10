@@ -1,80 +1,138 @@
 import socket
+import ssl
 import threading
-import select
+import sqlite3
+from cryptography.fernet import Fernet
+import pyotp
 
-# User database (for simplicity, using a dictionary; in production, use a secure database)
-users = {"user1": "password1", "user2": "password2"}
-clients = {}
+# Server configuration
+HOST = '127.0.0.1'
+PORT = 12345
+MAX_CLIENTS = 5
 
-def broadcast(message, exclude_client=None):
-    for client in clients:
-        if client != exclude_client:
-            try:
-                client.send(message.encode())
-            except:
-                clients.pop(client)
-                client.close()
+# Load encryption key from file
+with open("secret.key", "rb") as key_file:
+    key = key_file.read()
 
-def handle_client(client_socket, addr):
-    authenticated = False
-    username = None
+cipher = Fernet(key)
 
-    client_socket.send("Welcome! Please log in.\n".encode())
+# Load OTP secret from file
+with open("otp_secret.txt", "r") as secret_file:
+    otp_secret = secret_file.read().strip()
 
-    while not authenticated:
-        try:
-            client_socket.send("Username: ".encode())
-            username = client_socket.recv(1024).decode().strip()
-            client_socket.send("Password: ".encode())
-            password = client_socket.recv(1024).decode().strip()
+totp = pyotp.TOTP(otp_secret)
 
-            if username in users and users[username] == password:
-                client_socket.send("Login successful! Welcome to the chat room.\n".encode())
-                broadcast(f"{username} has joined the chat.", client_socket)
-                authenticated = True
-                clients[client_socket] = username
-            else:
-                client_socket.send("Invalid credentials. Try again.\n".encode())
-        except:
+# Initialize database for chat history
+conn = sqlite3.connect('chat_history.db')
+c = conn.cursor()
+c.execute('''CREATE TABLE IF NOT EXISTS history
+             (user TEXT, message TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+conn.commit()
+conn.close()
+
+clients = []
+user_status = {}
+
+
+def handle_client(client_socket, address):
+    global clients
+
+    # Create a new SQLite connection for this thread
+    conn = sqlite3.connect('chat_history.db')
+    c = conn.cursor()
+
+    try:
+        # Receive username
+        username = client_socket.recv(1024).decode()
+        print(f"Username received: {username}")
+
+        # Receive OTP for validation
+        otp = client_socket.recv(1024).decode()
+        print(f"OTP received: {otp}")
+        if not totp.verify(otp):
+            print(f"Invalid OTP from {username}")
+            client_socket.send("Invalid OTP".encode())
             client_socket.close()
             return
 
-    while True:
-        try:
-            message = client_socket.recv(1024).decode()
-            if message:
-                if message.startswith("@"):
-                    target_username, private_message = message.split(" ", 1)
-                    target_username = target_username[1:]
-                    for client, name in clients.items():
-                        if name == target_username:
-                            client.send(f"Private from {username}: {private_message}".encode())
-                            break
+        user_status[username] = 'online'
+        clients.append((client_socket, username))
+        client_socket.send("Authentication successful".encode())
+
+        # Broadcast welcome message
+        welcome_message = f"{username} has joined the chat."
+        broadcast(welcome_message, username)
+
+        while True:
+            try:
+                message = client_socket.recv(2048)
+                if message:
+                    decrypted_message = cipher.decrypt(message).decode()
+                    if decrypted_message == "!LEAVE":
+                        user_left_message = f"{username} has left the chat."
+                        broadcast(user_left_message, username, exclude_user=username)
+                        remove(client_socket, username)
+                        break
+                    broadcast(decrypted_message, username)
+                    save_message(c, username, decrypted_message)
                 else:
-                    broadcast(f"{username}: {message}", client_socket)
-            else:
-                clients.pop(client_socket)
-                client_socket.close()
-                broadcast(f"{username} has left the chat.")
+                    remove(client_socket, username)
+                    break
+            except Exception as e:
+                print(f"Error handling message from {username}: {e}")
                 break
-        except:
-            clients.pop(client_socket)
-            client_socket.close()
-            broadcast(f"{username} has left the chat.")
+    except Exception as e:
+        print(f"Error handling client {address}: {e}")
+        client_socket.close()
+    finally:
+        conn.close()
+
+
+def broadcast(message, username, exclude_user=None):
+    global clients
+    for client, user in clients:
+        if user != exclude_user:
+            try:
+                encrypted_message = cipher.encrypt(f"{username}: {message}".encode())
+                client.send(encrypted_message)
+            except:
+                remove(client, user)
+
+
+def save_message(c, username, message):
+    c.execute("INSERT INTO history (user, message) VALUES (?, ?)", (username, message))
+    c.connection.commit()
+
+
+def remove(client, username):
+    global clients
+    for c, user in clients:
+        if c == client:
+            clients.remove((c, user))
+            user_status[user] = 'offline'
             break
 
+
 def main():
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(certfile='cert.pem', keyfile='key.pem')
+
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.bind(('0.0.0.0', 12345))
-    server.listen(5)
-    print("Server started, waiting for connections...")
+    server.bind((HOST, PORT))
+    server.listen(MAX_CLIENTS)
+
+    print(f"Server started on {HOST}:{PORT}")
 
     while True:
         client_socket, addr = server.accept()
-        print(f"Connection from {addr}")
+        try:
+            client_socket = context.wrap_socket(client_socket, server_side=True)
+            print(f"Connection from {addr}")
+            threading.Thread(target=handle_client, args=(client_socket, addr)).start()
+        except ssl.SSLError as e:
+            print(f"SSL error with client {addr}: {e}")
+            client_socket.close()
 
-        thread = threading.Thread(target=handle_client, args=(client_socket, addr))
-        thread.start()
 
 if __name__ == "__main__":
     main()
