@@ -1,7 +1,5 @@
 from cryptography.fernet import Fernet #Import the fernet in crypto library
 
-
-
 # Generate a new encryption key
 key = Fernet.generate_key()
 
